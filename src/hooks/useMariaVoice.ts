@@ -385,7 +385,9 @@ export function useMariaVoice() {
             data = JSON.parse(rawText) as typeof data;
           } catch {
             throw new Error(
-              res.ok
+              res.status === 404
+                ? 'Voice API endpoint (/api/converse) returned 404. Ensure the /api folder is deployed to Vercel and GEMINI_API_KEY is set in Environment Variables.'
+                : res.ok
                 ? 'Unexpected non-JSON response from voice service.'
                 : `Voice service returned status ${res.status}. Please check server logs or GEMINI_API_KEY.`
             );

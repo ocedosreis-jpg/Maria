@@ -1,5 +1,4 @@
-import type { IncomingMessage, ServerResponse } from "http";
-import { GoogleGenAI, LiveServerMessage, Modality } from "@google/genai";
+import { GoogleGenAI, Modality } from "@google/genai";
 
 const MARIA_SYSTEM_INSTRUCTION = `
 You are Maria, the dedicated professional voice assistant for Océane Dos Reis.
@@ -56,7 +55,7 @@ GUIDELINES:
 - If a recruiter or visitor asks to contact Océane or schedule an interview, share her email (oce.dosreis@gmail.com) or phone number (07 61 59 09 56).
 `;
 
-const LANGUAGE_HINTS: Record<string, string> = {
+const LANGUAGE_HINTS = {
   en: "The visitor has selected English as their preferred language. Speak in polished, natural English unless they switch languages.",
   fr: "Le visiteur a choisi le français. Réponds dans un français élégant, naturel et professionnel, sauf s'il change de langue.",
   pt: "O visitante selecionou português. Responde em português elegante, natural e profissional, salvo se mudar de idioma.",
@@ -65,40 +64,29 @@ const LANGUAGE_HINTS: Record<string, string> = {
   auto: "Detect the visitor's spoken language (English, French, Portuguese, Arabic, or Spanish) and respond seamlessly in that same language.",
 };
 
-interface ConversationHistoryTurn {
-  speaker: "visitor" | "maria";
-  text: string;
-}
-
-async function readJsonBody(
-  req: IncomingMessage & { body?: unknown }
-): Promise<Record<string, unknown>> {
+async function readJsonBody(req) {
   if (req.body && typeof req.body === "object" && !Buffer.isBuffer(req.body)) {
-    return req.body as Record<string, unknown>;
+    return req.body;
   }
   if (typeof req.body === "string") {
-    return req.body.trim() ? (JSON.parse(req.body) as Record<string, unknown>) : {};
+    return req.body.trim() ? JSON.parse(req.body) : {};
   }
-  const chunks: Buffer[] = [];
+  const chunks = [];
   for await (const chunk of req) {
     chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
   }
   const raw = Buffer.concat(chunks).toString("utf8").trim();
   if (!raw) return {};
-  return JSON.parse(raw) as Record<string, unknown>;
+  return JSON.parse(raw);
 }
 
-function sendJson(
-  res: ServerResponse,
-  status: number,
-  payload: Record<string, unknown>
-) {
+function sendJson(res, status, payload) {
   res.statusCode = status;
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   res.end(JSON.stringify(payload));
 }
 
-function buildWavBase64(pcmBase64: string): string {
+function buildWavBase64(pcmBase64) {
   const rawPcm = Buffer.from(pcmBase64, "base64");
   const wavHeader = Buffer.alloc(44);
   wavHeader.write("RIFF", 0);
@@ -117,12 +105,7 @@ function buildWavBase64(pcmBase64: string): string {
   return Buffer.concat([wavHeader, rawPcm]).toString("base64");
 }
 
-async function runStatelessTurn(input: {
-  lang: string;
-  text?: string;
-  audioBase64?: string;
-  history?: ConversationHistoryTurn[];
-}) {
+async function runStatelessTurn(input) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
     throw new Error(
@@ -141,21 +124,17 @@ async function runStatelessTurn(input: {
   });
 
   const langHint = LANGUAGE_HINTS[input.lang] ?? LANGUAGE_HINTS.en;
-  const audioChunks: string[] = [];
+  const audioChunks = [];
   let inputTranscript = "";
   let outputTranscript = "";
 
-  return new Promise<{
-    audioChunks: string[];
-    inputTranscript: string;
-    outputTranscript: string;
-  }>((resolve, reject) => {
+  return new Promise((resolve, reject) => {
     let settled = false;
     let setupDone = false;
     let inputSent = false;
-    let session: Awaited<ReturnType<typeof ai.live.connect>> | null = null;
+    let session = null;
 
-    const finish = (err?: unknown) => {
+    const finish = (err) => {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
@@ -177,7 +156,7 @@ async function runStatelessTurn(input: {
 
       const historyTurns = (input.history ?? [])
         .slice(-6)
-        .filter((h) => h.text && h.text.trim().length > 0)
+        .filter((h) => h && typeof h.text === "string" && h.text.trim().length > 0)
         .map((h) => ({
           role: h.speaker === "maria" ? "model" : "user",
           parts: [{ text: h.text }],
@@ -240,7 +219,7 @@ async function runStatelessTurn(input: {
           systemInstruction: `${MARIA_SYSTEM_INSTRUCTION}\n\nCURRENT LANGUAGE PREFERENCE:\n${langHint}`,
         },
         callbacks: {
-          onmessage: (message: LiveServerMessage) => {
+          onmessage: (message) => {
             if (message.setupComplete) {
               setupDone = true;
               maybeSendInput();
@@ -263,7 +242,7 @@ async function runStatelessTurn(input: {
               finish();
             }
           },
-          onerror: (err: unknown) => {
+          onerror: (err) => {
             finish(err);
           },
           onclose: () => {
@@ -287,10 +266,7 @@ async function runStatelessTurn(input: {
   });
 }
 
-export default async function handler(
-  req: IncomingMessage & { body?: unknown },
-  res: ServerResponse
-) {
+export default async function handler(req, res) {
   if (req.method === "OPTIONS") {
     res.statusCode = 204;
     res.end();
@@ -308,9 +284,7 @@ export default async function handler(
     const text = typeof body.text === "string" ? body.text : undefined;
     const audioBase64 =
       typeof body.audioBase64 === "string" ? body.audioBase64 : undefined;
-    const history = Array.isArray(body.history)
-      ? (body.history as ConversationHistoryTurn[])
-      : undefined;
+    const history = Array.isArray(body.history) ? body.history : undefined;
 
     const result = await runStatelessTurn({
       lang,
@@ -324,7 +298,7 @@ export default async function handler(
       inputTranscript: result.inputTranscript,
       outputTranscript: result.outputTranscript,
     });
-  } catch (err: unknown) {
+  } catch (err) {
     const message =
       err instanceof Error ? err.message : "Failed to process Maria voice turn.";
     sendJson(res, 500, { error: message });
