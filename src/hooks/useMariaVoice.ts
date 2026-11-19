@@ -10,6 +10,17 @@ export interface TranscriptEntry {
   isArabic: boolean;
 }
 
+interface LiveBridgeEvent {
+  ready?: boolean;
+  audio?: string;
+  inputTranscript?: string;
+  outputTranscript?: string;
+  interrupted?: boolean;
+  turnComplete?: boolean;
+  sessionClosed?: boolean;
+  error?: string;
+}
+
 function pcmFloat32ToBase64(float32: Float32Array): string {
   const buffer = new ArrayBuffer(float32.length * 2);
   const view = new DataView(buffer);
@@ -57,6 +68,9 @@ export function useMariaVoice() {
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
 
   const wsRef = useRef<WebSocket | null>(null);
+  const sseRef = useRef<EventSource | null>(null);
+  const httpSessionIdRef = useRef<string | null>(null);
+  const transportModeRef = useRef<'ws' | 'sse' | null>(null);
   const inputCtxRef = useRef<AudioContext | null>(null);
   const outputCtxRef = useRef<AudioContext | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
@@ -68,6 +82,7 @@ export function useMariaVoice() {
   const isReadyRef = useRef<boolean>(false);
   const pendingTextRef = useRef<string | null>(null);
   const timerRef = useRef<number | null>(null);
+  const sessionTokenRef = useRef<number>(0);
 
   useEffect(() => {
     isMutedRef.current = isMuted;
@@ -86,6 +101,49 @@ export function useMariaVoice() {
     nextStartTimeRef.current = 0;
   }, []);
 
+  const closeTransportsOnly = useCallback(() => {
+    if (wsRef.current) {
+      const ws = wsRef.current;
+      wsRef.current = null;
+      ws.onopen = null;
+      ws.onmessage = null;
+      ws.onerror = null;
+      ws.onclose = null;
+      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+        try {
+          ws.close();
+        } catch {
+          // ignore
+        }
+      }
+    }
+
+    if (sseRef.current) {
+      const es = sseRef.current;
+      sseRef.current = null;
+      es.onmessage = null;
+      es.onerror = null;
+      try {
+        es.close();
+      } catch {
+        // ignore
+      }
+    }
+
+    if (httpSessionIdRef.current) {
+      const id = httpSessionIdRef.current;
+      httpSessionIdRef.current = null;
+      void fetch('/api/live/close', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId: id }),
+      }).catch(() => {});
+    }
+
+    transportModeRef.current = null;
+    isReadyRef.current = false;
+  }, []);
+
   const teardownAudioAndSocket = useCallback(() => {
     if (timerRef.current !== null) {
       window.clearInterval(timerRef.current);
@@ -93,6 +151,7 @@ export function useMariaVoice() {
     }
 
     clearScheduledAudio();
+    closeTransportsOnly();
 
     if (processorRef.current) {
       processorRef.current.onaudioprocess = null;
@@ -128,23 +187,38 @@ export function useMariaVoice() {
       outputCtxRef.current = null;
     }
 
-    if (wsRef.current) {
-      const ws = wsRef.current;
-      wsRef.current = null;
-      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
-        ws.close();
-      }
-    }
-
-    isReadyRef.current = false;
     setAudioLevel(0);
-  }, [clearScheduledAudio]);
+  }, [clearScheduledAudio, closeTransportsOnly]);
 
   useEffect(() => {
     return () => {
+      sessionTokenRef.current += 1;
       teardownAudioAndSocket();
     };
   }, [teardownAudioAndSocket]);
+
+  const sendLivePayload = useCallback((payload: { audio?: string; text?: string }) => {
+    if (!isReadyRef.current) return;
+
+    if (transportModeRef.current === 'ws') {
+      const ws = wsRef.current;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify(payload));
+      }
+      return;
+    }
+
+    if (transportModeRef.current === 'sse' && httpSessionIdRef.current) {
+      void fetch('/api/live/input', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sessionId: httpSessionIdRef.current,
+          ...payload,
+        }),
+      }).catch(() => {});
+    }
+  }, []);
 
   const appendTranscript = useCallback((speaker: 'visitor' | 'maria', chunk: string) => {
     if (!chunk) return;
@@ -208,7 +282,7 @@ export function useMariaVoice() {
 
     source.onended = () => {
       activeSourcesRef.current.delete(source);
-      if (activeSourcesRef.current.size === 0 && wsRef.current?.readyState === WebSocket.OPEN) {
+      if (activeSourcesRef.current.size === 0 && isReadyRef.current) {
         setConnectionState('listening');
         setAudioLevel(0);
       }
@@ -217,12 +291,155 @@ export function useMariaVoice() {
     source.start(startTime);
   }, []);
 
+  const attachMicProcessor = useCallback(() => {
+    if (!inputCtxRef.current || !mediaStreamRef.current || processorRef.current) return;
+    if (inputCtxRef.current.state === 'suspended') {
+      void inputCtxRef.current.resume();
+    }
+
+    const source = inputCtxRef.current.createMediaStreamSource(mediaStreamRef.current);
+    const processor = inputCtxRef.current.createScriptProcessor(4096, 1, 1);
+    sourceNodeRef.current = source;
+    processorRef.current = processor;
+
+    source.connect(processor);
+    processor.connect(inputCtxRef.current.destination);
+
+    processor.onaudioprocess = (event) => {
+      if (isMutedRef.current || !isReadyRef.current) return;
+
+      const channel = event.inputBuffer.getChannelData(0);
+      if (activeSourcesRef.current.size === 0) {
+        let sum = 0;
+        for (let i = 0; i < channel.length; i += 32) {
+          sum += Math.abs(channel[i]);
+        }
+        const level = Math.min(1, (sum / (channel.length / 32)) * 4.2);
+        setAudioLevel((prev) => prev * 0.6 + level * 0.4);
+      }
+
+      const base64 = pcmFloat32ToBase64(channel);
+      sendLivePayload({ audio: base64 });
+    };
+  }, [sendLivePayload]);
+
+  const handleBridgeMessage = useCallback(
+    (msg: LiveBridgeEvent, targetLang: MariaLanguageCode, token: number) => {
+      if (sessionTokenRef.current !== token) return;
+
+      if (msg.error) {
+        setErrorMessage(msg.error);
+        setConnectionState('error');
+        teardownAudioAndSocket();
+        return;
+      }
+
+      if (msg.ready) {
+        isReadyRef.current = true;
+        setConnectionState('listening');
+        if (timerRef.current === null) {
+          timerRef.current = window.setInterval(() => {
+            setElapsedSeconds((s) => s + 1);
+          }, 1000);
+        }
+
+        if (pendingTextRef.current) {
+          const promptToSend = pendingTextRef.current;
+          pendingTextRef.current = null;
+          appendTranscript('visitor', promptToSend);
+          sendLivePayload({ text: promptToSend });
+        } else {
+          const langObj =
+            MARIA_LANGUAGES.find((l) => l.code === targetLang) ?? MARIA_LANGUAGES[0];
+          sendLivePayload({ text: langObj.greetingInstruction });
+        }
+        return;
+      }
+
+      if (msg.interrupted) {
+        clearScheduledAudio();
+        setConnectionState('listening');
+        return;
+      }
+
+      if (msg.inputTranscript) {
+        appendTranscript('visitor', msg.inputTranscript);
+      }
+
+      if (msg.outputTranscript) {
+        appendTranscript('maria', msg.outputTranscript);
+      }
+
+      if (msg.audio) {
+        playPcmChunk(msg.audio);
+      }
+
+      if (msg.sessionClosed) {
+        setConnectionState('idle');
+        teardownAudioAndSocket();
+      }
+    },
+    [
+      appendTranscript,
+      clearScheduledAudio,
+      playPcmChunk,
+      sendLivePayload,
+      teardownAudioAndSocket,
+    ]
+  );
+
+  const connectSseFallback = useCallback(
+    (targetLang: MariaLanguageCode, token: number) => {
+      if (sessionTokenRef.current !== token) return;
+
+      closeTransportsOnly();
+      const sessionId =
+        typeof crypto !== 'undefined' && crypto.randomUUID
+          ? crypto.randomUUID()
+          : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+
+      httpSessionIdRef.current = sessionId;
+      transportModeRef.current = 'sse';
+
+      const es = new EventSource(
+        `/api/live/stream?sessionId=${encodeURIComponent(sessionId)}&lang=${encodeURIComponent(targetLang)}`
+      );
+      sseRef.current = es;
+
+      es.onopen = () => {
+        if (sessionTokenRef.current !== token || sseRef.current !== es) return;
+        attachMicProcessor();
+      };
+
+      es.onmessage = (event) => {
+        if (sessionTokenRef.current !== token || sseRef.current !== es) return;
+        try {
+          const msg = JSON.parse(event.data as string) as LiveBridgeEvent;
+          handleBridgeMessage(msg, targetLang, token);
+        } catch {
+          // ignore malformed chunk
+        }
+      };
+
+      es.onerror = () => {
+        if (sessionTokenRef.current !== token || sseRef.current !== es) return;
+        setErrorMessage('Unable to reach the voice assistant service. Please try again.');
+        setConnectionState('error');
+        teardownAudioAndSocket();
+      };
+    },
+    [attachMicProcessor, closeTransportsOnly, handleBridgeMessage, teardownAudioAndSocket]
+  );
+
   const startSession = useCallback(
     async (overrideLang?: MariaLanguageCode, initialTextPrompt?: string) => {
       const targetLang = overrideLang ?? selectedLanguage;
       if (overrideLang) {
         setSelectedLanguage(overrideLang);
       }
+
+      const token = sessionTokenRef.current + 1;
+      sessionTokenRef.current = token;
 
       teardownAudioAndSocket();
       setErrorMessage(null);
@@ -241,7 +458,6 @@ export function useMariaVoice() {
         }
 
         // Request microphone softly: if unavailable or denied, continue in listen-and-type mode
-        let hasMic = false;
         if (navigator.mediaDevices?.getUserMedia) {
           try {
             const inputCtx = new AudioContext({ sampleRate: 16000 });
@@ -253,11 +469,14 @@ export function useMariaVoice() {
                 autoGainControl: true,
               },
             });
+            if (sessionTokenRef.current !== token) {
+              stream.getTracks().forEach((t) => t.stop());
+              return;
+            }
             mediaStreamRef.current = stream;
-            hasMic = true;
             setMicAvailable(true);
           } catch {
-            hasMic = false;
+            if (sessionTokenRef.current !== token) return;
             setMicAvailable(false);
             setIsMuted(true);
             isMutedRef.current = true;
@@ -270,7 +489,6 @@ export function useMariaVoice() {
             );
           }
         } else {
-          hasMic = false;
           setMicAvailable(false);
           setIsMuted(true);
           isMutedRef.current = true;
@@ -279,123 +497,62 @@ export function useMariaVoice() {
           );
         }
 
+        if (sessionTokenRef.current !== token) return;
+
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const ws = new WebSocket(
           `${protocol}//${window.location.host}/live?lang=${encodeURIComponent(targetLang)}`
         );
         wsRef.current = ws;
+        transportModeRef.current = 'ws';
+
+        let wsOpened = false;
+        let fellBackToSse = false;
+
+        const triggerSseFallback = () => {
+          if (fellBackToSse || sessionTokenRef.current !== token) return;
+          fellBackToSse = true;
+          connectSseFallback(targetLang, token);
+        };
 
         ws.onopen = () => {
-          if (!hasMic || !inputCtxRef.current || !mediaStreamRef.current) return;
-          if (inputCtxRef.current.state === 'suspended') {
-            void inputCtxRef.current.resume();
-          }
-
-          const source = inputCtxRef.current.createMediaStreamSource(mediaStreamRef.current);
-          const processor = inputCtxRef.current.createScriptProcessor(4096, 1, 1);
-          sourceNodeRef.current = source;
-          processorRef.current = processor;
-
-          source.connect(processor);
-          processor.connect(inputCtxRef.current.destination);
-
-          processor.onaudioprocess = (event) => {
-            if (isMutedRef.current || !isReadyRef.current) return;
-            if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
-
-            const channel = event.inputBuffer.getChannelData(0);
-            if (activeSourcesRef.current.size === 0) {
-              let sum = 0;
-              for (let i = 0; i < channel.length; i += 32) {
-                sum += Math.abs(channel[i]);
-              }
-              const level = Math.min(1, (sum / (channel.length / 32)) * 4.2);
-              setAudioLevel((prev) => prev * 0.6 + level * 0.4);
-            }
-
-            const base64 = pcmFloat32ToBase64(channel);
-            wsRef.current.send(JSON.stringify({ audio: base64 }));
-          };
+          if (sessionTokenRef.current !== token || wsRef.current !== ws) return;
+          wsOpened = true;
+          attachMicProcessor();
         };
 
         ws.onmessage = (event) => {
+          if (sessionTokenRef.current !== token || wsRef.current !== ws) return;
           try {
-            const msg = JSON.parse(event.data as string) as {
-              ready?: boolean;
-              audio?: string;
-              inputTranscript?: string;
-              outputTranscript?: string;
-              interrupted?: boolean;
-              turnComplete?: boolean;
-              sessionClosed?: boolean;
-              error?: string;
-            };
-
-            if (msg.error) {
-              setErrorMessage(msg.error);
-              setConnectionState('error');
-              teardownAudioAndSocket();
-              return;
-            }
-
-            if (msg.ready) {
-              isReadyRef.current = true;
-              setConnectionState('listening');
-              timerRef.current = window.setInterval(() => {
-                setElapsedSeconds((s) => s + 1);
-              }, 1000);
-
-              if (pendingTextRef.current) {
-                const promptToSend = pendingTextRef.current;
-                pendingTextRef.current = null;
-                appendTranscript('visitor', promptToSend);
-                ws.send(JSON.stringify({ text: promptToSend }));
-              } else {
-                const langObj =
-                  MARIA_LANGUAGES.find((l) => l.code === targetLang) ?? MARIA_LANGUAGES[0];
-                ws.send(JSON.stringify({ text: langObj.greetingInstruction }));
-              }
-              return;
-            }
-
-            if (msg.interrupted) {
-              clearScheduledAudio();
-              setConnectionState('listening');
-              return;
-            }
-
-            if (msg.inputTranscript) {
-              appendTranscript('visitor', msg.inputTranscript);
-            }
-
-            if (msg.outputTranscript) {
-              appendTranscript('maria', msg.outputTranscript);
-            }
-
-            if (msg.audio) {
-              playPcmChunk(msg.audio);
-            }
-
-            if (msg.sessionClosed) {
-              setConnectionState('idle');
-              teardownAudioAndSocket();
-            }
+            const msg = JSON.parse(event.data as string) as LiveBridgeEvent;
+            handleBridgeMessage(msg, targetLang, token);
           } catch {
             // Ignore malformed messages
           }
         };
 
         ws.onerror = () => {
+          if (sessionTokenRef.current !== token || wsRef.current !== ws) return;
+          if (!wsOpened) {
+            triggerSseFallback();
+            return;
+          }
           setErrorMessage('Unable to reach the voice assistant service. Please try again.');
           setConnectionState('error');
           teardownAudioAndSocket();
         };
 
         ws.onclose = () => {
+          if (sessionTokenRef.current !== token || wsRef.current !== ws) return;
+          if (!wsOpened) {
+            triggerSseFallback();
+            return;
+          }
           setConnectionState((prev) => (prev === 'error' ? 'error' : 'idle'));
           teardownAudioAndSocket();
         };
       } catch (err: unknown) {
+        if (sessionTokenRef.current !== token) return;
         const message =
           err instanceof Error ? err.message : 'Unable to start voice session.';
         setErrorMessage(message);
@@ -404,15 +561,16 @@ export function useMariaVoice() {
       }
     },
     [
-      appendTranscript,
-      clearScheduledAudio,
-      playPcmChunk,
+      attachMicProcessor,
+      connectSseFallback,
+      handleBridgeMessage,
       selectedLanguage,
       teardownAudioAndSocket,
     ]
   );
 
   const stopSession = useCallback(() => {
+    sessionTokenRef.current += 1;
     teardownAudioAndSocket();
     setConnectionState('idle');
   }, [teardownAudioAndSocket]);
@@ -427,27 +585,28 @@ export function useMariaVoice() {
       const trimmed = text.trim();
       if (!trimmed) return;
 
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN && isReadyRef.current) {
+      if (isReadyRef.current) {
         appendTranscript('visitor', trimmed);
-        wsRef.current.send(JSON.stringify({ text: trimmed }));
+        sendLivePayload({ text: trimmed });
       } else {
         void startSession(selectedLanguage, trimmed);
       }
     },
-    [appendTranscript, selectedLanguage, startSession]
+    [appendTranscript, selectedLanguage, sendLivePayload, startSession]
   );
 
-  const switchLanguage = useCallback((lang: MariaLanguageCode) => {
-    setSelectedLanguage(lang);
-    const langObj = MARIA_LANGUAGES.find((l) => l.code === lang);
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN && isReadyRef.current && langObj) {
-      wsRef.current.send(
-        JSON.stringify({
+  const switchLanguage = useCallback(
+    (lang: MariaLanguageCode) => {
+      setSelectedLanguage(lang);
+      const langObj = MARIA_LANGUAGES.find((l) => l.code === lang);
+      if (isReadyRef.current && langObj) {
+        sendLivePayload({
           text: `Please switch our conversation to ${langObj.label} now and briefly acknowledge in ${langObj.label}.`,
-        })
-      );
-    }
-  }, []);
+        });
+      }
+    },
+    [sendLivePayload]
+  );
 
   const clearTranscript = useCallback(() => {
     setTranscript([]);
