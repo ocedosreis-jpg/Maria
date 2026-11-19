@@ -21,6 +21,30 @@ interface LiveBridgeEvent {
   error?: string;
 }
 
+const TARGET_INPUT_SAMPLE_RATE = 16000;
+const TARGET_OUTPUT_SAMPLE_RATE = 24000;
+
+function resampleFloat32(
+  input: Float32Array,
+  sourceSampleRate: number,
+  targetSampleRate: number
+): Float32Array {
+  if (sourceSampleRate === targetSampleRate || input.length === 0) {
+    return input;
+  }
+  const ratio = sourceSampleRate / targetSampleRate;
+  const outputLength = Math.max(1, Math.round(input.length / ratio));
+  const output = new Float32Array(outputLength);
+  for (let i = 0; i < outputLength; i++) {
+    const srcIndex = i * ratio;
+    const low = Math.floor(srcIndex);
+    const high = Math.min(low + 1, input.length - 1);
+    const frac = srcIndex - low;
+    output[i] = input[low] * (1 - frac) + input[high] * frac;
+  }
+  return output;
+}
+
 function pcmFloat32ToBase64(float32: Float32Array): string {
   const buffer = new ArrayBuffer(float32.length * 2);
   const view = new DataView(buffer);
@@ -56,6 +80,17 @@ function containsArabic(text: string): boolean {
   return /[\u0600-\u06FF]/.test(text);
 }
 
+function formatMicErrorNotice(err: unknown): string {
+  const name = err instanceof Error ? err.name : '';
+  if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
+    return 'Microphone permission was blocked. Allow microphone access in your browser settings to speak verbally, or type/click a prompt below.';
+  }
+  if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
+    return 'No microphone was detected. Maria is active in listen-only mode — click any prompt or type below.';
+  }
+  return 'Microphone unavailable here — Maria is active in listen-only mode. Click any prompt or type below to hear her respond.';
+}
+
 export function useMariaVoice() {
   const [selectedLanguage, setSelectedLanguage] = useState<MariaLanguageCode>('en');
   const [connectionState, setConnectionState] = useState<VoiceConnectionState>('idle');
@@ -70,12 +105,14 @@ export function useMariaVoice() {
   const wsRef = useRef<WebSocket | null>(null);
   const sseRef = useRef<EventSource | null>(null);
   const httpSessionIdRef = useRef<string | null>(null);
+  const sseSendQueueRef = useRef<Promise<void>>(Promise.resolve());
   const transportModeRef = useRef<'ws' | 'sse' | null>(null);
   const inputCtxRef = useRef<AudioContext | null>(null);
   const outputCtxRef = useRef<AudioContext | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const silentGainRef = useRef<GainNode | null>(null);
   const activeSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const nextStartTimeRef = useRef<number>(0);
   const isMutedRef = useRef<boolean>(false);
@@ -121,6 +158,7 @@ export function useMariaVoice() {
     if (sseRef.current) {
       const es = sseRef.current;
       sseRef.current = null;
+      es.onopen = null;
       es.onmessage = null;
       es.onerror = null;
       try {
@@ -140,6 +178,7 @@ export function useMariaVoice() {
       }).catch(() => {});
     }
 
+    sseSendQueueRef.current = Promise.resolve();
     transportModeRef.current = null;
     isReadyRef.current = false;
   }, []);
@@ -161,6 +200,15 @@ export function useMariaVoice() {
         // ignore
       }
       processorRef.current = null;
+    }
+
+    if (silentGainRef.current) {
+      try {
+        silentGainRef.current.disconnect();
+      } catch {
+        // ignore
+      }
+      silentGainRef.current = null;
     }
 
     if (sourceNodeRef.current) {
@@ -209,14 +257,19 @@ export function useMariaVoice() {
     }
 
     if (transportModeRef.current === 'sse' && httpSessionIdRef.current) {
-      void fetch('/api/live/input', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          sessionId: httpSessionIdRef.current,
-          ...payload,
-        }),
-      }).catch(() => {});
+      const sessionId = httpSessionIdRef.current;
+      sseSendQueueRef.current = sseSendQueueRef.current
+        .then(() =>
+          fetch('/api/live/input', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              sessionId,
+              ...payload,
+            }),
+          }).then(() => undefined)
+        )
+        .catch(() => {});
     }
   }, []);
 
@@ -266,7 +319,7 @@ export function useMariaVoice() {
     const avg = sum / Math.ceil(float32.length / step);
     setAudioLevel(Math.min(1, avg * 3.8));
 
-    const audioBuffer = ctx.createBuffer(1, float32.length, 24000);
+    const audioBuffer = ctx.createBuffer(1, float32.length, TARGET_OUTPUT_SAMPLE_RATE);
     audioBuffer.copyToChannel(new Float32Array(float32), 0);
 
     const source = ctx.createBufferSource();
@@ -292,35 +345,55 @@ export function useMariaVoice() {
   }, []);
 
   const attachMicProcessor = useCallback(() => {
-    if (!inputCtxRef.current || !mediaStreamRef.current || processorRef.current) return;
-    if (inputCtxRef.current.state === 'suspended') {
-      void inputCtxRef.current.resume();
+    const ctx = inputCtxRef.current;
+    const stream = mediaStreamRef.current;
+    if (!ctx || !stream || processorRef.current) return;
+
+    if (ctx.state === 'suspended') {
+      void ctx.resume();
     }
 
-    const source = inputCtxRef.current.createMediaStreamSource(mediaStreamRef.current);
-    const processor = inputCtxRef.current.createScriptProcessor(4096, 1, 1);
-    sourceNodeRef.current = source;
-    processorRef.current = processor;
+    try {
+      const source = ctx.createMediaStreamSource(stream);
+      const processor = ctx.createScriptProcessor(4096, 1, 1);
+      const silentGain = ctx.createGain();
+      silentGain.gain.value = 0;
 
-    source.connect(processor);
-    processor.connect(inputCtxRef.current.destination);
+      sourceNodeRef.current = source;
+      processorRef.current = processor;
+      silentGainRef.current = silentGain;
 
-    processor.onaudioprocess = (event) => {
-      if (isMutedRef.current || !isReadyRef.current) return;
+      source.connect(processor);
+      processor.connect(silentGain);
+      silentGain.connect(ctx.destination);
 
-      const channel = event.inputBuffer.getChannelData(0);
-      if (activeSourcesRef.current.size === 0) {
-        let sum = 0;
-        for (let i = 0; i < channel.length; i += 32) {
-          sum += Math.abs(channel[i]);
+      processor.onaudioprocess = (event) => {
+        if (isMutedRef.current || !isReadyRef.current) return;
+
+        const rawChannel = event.inputBuffer.getChannelData(0);
+        if (activeSourcesRef.current.size === 0) {
+          let sum = 0;
+          for (let i = 0; i < rawChannel.length; i += 32) {
+            sum += Math.abs(rawChannel[i]);
+          }
+          const level = Math.min(1, (sum / (rawChannel.length / 32)) * 4.8);
+          setAudioLevel((prev) => prev * 0.55 + level * 0.45);
         }
-        const level = Math.min(1, (sum / (channel.length / 32)) * 4.2);
-        setAudioLevel((prev) => prev * 0.6 + level * 0.4);
-      }
 
-      const base64 = pcmFloat32ToBase64(channel);
-      sendLivePayload({ audio: base64 });
-    };
+        const resampled = resampleFloat32(
+          rawChannel,
+          ctx.sampleRate,
+          TARGET_INPUT_SAMPLE_RATE
+        );
+        const base64 = pcmFloat32ToBase64(resampled);
+        sendLivePayload({ audio: base64 });
+      };
+    } catch (err) {
+      setMicAvailable(false);
+      setIsMuted(true);
+      isMutedRef.current = true;
+      setMicNotice(formatMicErrorNotice(err));
+    }
   }, [sendLivePayload]);
 
   const handleBridgeMessage = useCallback(
@@ -451,17 +524,27 @@ export function useMariaVoice() {
       pendingTextRef.current = initialTextPrompt ?? null;
 
       try {
-        const outputCtx = new AudioContext({ sampleRate: 24000 });
+        // Create & resume both AudioContexts synchronously inside the user gesture
+        let outputCtx: AudioContext;
+        try {
+          outputCtx = new AudioContext({ sampleRate: TARGET_OUTPUT_SAMPLE_RATE });
+        } catch {
+          outputCtx = new AudioContext();
+        }
         outputCtxRef.current = outputCtx;
         if (outputCtx.state === 'suspended') {
           void outputCtx.resume();
         }
 
-        // Request microphone softly: if unavailable or denied, continue in listen-and-type mode
+        // Use native hardware sample rate for inputCtx so MediaStreamSource never fails sample-rate matching
+        const inputCtx = new AudioContext();
+        inputCtxRef.current = inputCtx;
+        if (inputCtx.state === 'suspended') {
+          void inputCtx.resume();
+        }
+
         if (navigator.mediaDevices?.getUserMedia) {
           try {
-            const inputCtx = new AudioContext({ sampleRate: 16000 });
-            inputCtxRef.current = inputCtx;
             const stream = await navigator.mediaDevices.getUserMedia({
               audio: {
                 echoCancellation: true,
@@ -475,7 +558,7 @@ export function useMariaVoice() {
             }
             mediaStreamRef.current = stream;
             setMicAvailable(true);
-          } catch {
+          } catch (micErr) {
             if (sessionTokenRef.current !== token) return;
             setMicAvailable(false);
             setIsMuted(true);
@@ -484,17 +567,17 @@ export function useMariaVoice() {
               void inputCtxRef.current.close().catch(() => {});
               inputCtxRef.current = null;
             }
-            setMicNotice(
-              'Microphone unavailable — Maria is active in listen-only mode. Click any prompt or type below to hear her respond.'
-            );
+            setMicNotice(formatMicErrorNotice(micErr));
           }
         } else {
           setMicAvailable(false);
           setIsMuted(true);
           isMutedRef.current = true;
-          setMicNotice(
-            'Microphone unavailable — Maria is active in listen-only mode. Click any prompt or type below to hear her respond.'
-          );
+          if (inputCtxRef.current) {
+            void inputCtxRef.current.close().catch(() => {});
+            inputCtxRef.current = null;
+          }
+          setMicNotice(formatMicErrorNotice(new Error('NoMediaDevices')));
         }
 
         if (sessionTokenRef.current !== token) return;
