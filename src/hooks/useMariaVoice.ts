@@ -73,7 +73,13 @@ function pcmFloat32ToBase64(float32: Float32Array): string {
 }
 
 function base64ToFloat32Pcm(base64: string): Float32Array {
-  const binary = atob(base64);
+  const normalized = base64
+    .replace(/-/g, '+')
+    .replace(/_/g, '/')
+    .replace(/\s+/g, '');
+  const padLength = (4 - (normalized.length % 4)) % 4;
+  const padded = normalized + '='.repeat(padLength);
+  const binary = atob(padded);
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) {
     bytes[i] = binary.charCodeAt(i);
@@ -367,12 +373,24 @@ export function useMariaVoice() {
           }),
         });
 
-        const data = (await res.json()) as {
+        const rawText = await res.text();
+        let data: {
           audioChunks?: string[];
           inputTranscript?: string;
           outputTranscript?: string;
           error?: string;
-        };
+        } = {};
+        if (rawText) {
+          try {
+            data = JSON.parse(rawText) as typeof data;
+          } catch {
+            throw new Error(
+              res.ok
+                ? 'Unexpected non-JSON response from voice service.'
+                : `Voice service returned status ${res.status}. Please check server logs or GEMINI_API_KEY.`
+            );
+          }
+        }
 
         if (sessionTokenRef.current !== token) return;
 
@@ -705,9 +723,16 @@ export function useMariaVoice() {
         if (sessionTokenRef.current !== token) return;
 
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const ws = new WebSocket(
-          `${protocol}//${window.location.host}/live?lang=${encodeURIComponent(targetLang)}`
-        );
+        let ws: WebSocket;
+        try {
+          ws = new WebSocket(
+            `${protocol}//${window.location.host}/live?lang=${encodeURIComponent(targetLang)}`
+          );
+        } catch {
+          activateVercelRestMode(targetLang, token);
+          return;
+        }
+
         wsRef.current = ws;
         transportModeRef.current = 'ws';
 
@@ -725,7 +750,7 @@ export function useMariaVoice() {
           if (!wsOpened && sessionTokenRef.current === token && wsRef.current === ws) {
             fallbackToRest();
           }
-        }, 2500);
+        }, 1200);
 
         ws.onopen = () => {
           window.clearTimeout(wsTimeout);
