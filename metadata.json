@@ -1,0 +1,6 @@
+{
+  "name": "Océane Dos Reis — Maria Voice Assistant",
+  "description": "Minimalist portfolio and real-time multilingual voice assistant Maria for Océane Dos Reis, fluent in English, French, Portuguese, Arabic, and Spanish.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
